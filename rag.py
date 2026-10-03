@@ -33,20 +33,42 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # LOAD ENVIRONMENT
 # =========================================================
 
+# Local development: reads sa.env if it exists
 load_dotenv(os.path.join(BASE_DIR, "sa.env"))
 
 api_key = os.getenv("GEMINI_API_KEY")
 
+# Streamlit Cloud: fall back to Secrets
 if not api_key:
-    raise ValueError("Gemini API key not found in sa.env")
+    try:
+        import streamlit as st
+
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        api_key = None
+
+if not api_key:
+    raise ValueError(
+        "Gemini API key not found. Set GEMINI_API_KEY in sa.env (local) "
+        "or in Streamlit Secrets (cloud)."
+    )
 
 
 client = genai.Client(api_key=api_key)
 
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.5-flash-lite"
-)
+# Model name: env var -> Streamlit secret -> default
+GEMINI_MODEL = os.getenv("GEMINI_MODEL")
+
+if not GEMINI_MODEL:
+    try:
+        import streamlit as st
+
+        GEMINI_MODEL = st.secrets.get("GEMINI_MODEL")
+    except Exception:
+        GEMINI_MODEL = None
+
+if not GEMINI_MODEL:
+    GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
 # =========================================================
@@ -69,9 +91,7 @@ MAX_OUTPUT_TOKENS = 1024
 
 print("Loading embedding model...")
 
-embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
-)
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 print("Embedding model loaded.")
 
@@ -80,10 +100,14 @@ print("Embedding model loaded.")
 # GLOBAL DOCUMENT DATA
 # =========================================================
 
+# Combined index (rebuilt from `documents` whenever it changes)
 index = None
 chunks = []
 chunk_metadata = []
 keyword_index = {}
+
+# Per-file storage: filename -> {"chunks": [...], "embeddings": ndarray}
+documents = {}
 
 current_document_name = None
 
@@ -93,42 +117,18 @@ current_document_name = None
 # =========================================================
 
 BASIC_RESPONSES = {
-
-    "hi":
-        "Hello! Upload a document and ask me a question about it.",
-
-    "hello":
-        "Hello! Upload a document and ask me a question about it.",
-
-    "hey":
-        "Hey! Upload a document and ask me a question about it.",
-
-    "good morning":
-        "Good morning! Upload a document and ask me a question.",
-
-    "good afternoon":
-        "Good afternoon! Upload a document and ask me a question.",
-
-    "good evening":
-        "Good evening! Upload a document and ask me a question.",
-
-    "thanks":
-        "You're welcome!",
-
-    "thank you":
-        "You're welcome!",
-
-    "thanks a lot":
-        "You're welcome!",
-
-    "thank you so much":
-        "You're welcome!",
-
-    "bye":
-        "Goodbye! Have a great day!",
-
-    "goodbye":
-        "Goodbye! Have a great day!"
+    "hi": "Hello! Upload a document and ask me a question about it.",
+    "hello": "Hello! Upload a document and ask me a question about it.",
+    "hey": "Hey! Upload a document and ask me a question about it.",
+    "good morning": "Good morning! Upload a document and ask me a question.",
+    "good afternoon": "Good afternoon! Upload a document and ask me a question.",
+    "good evening": "Good evening! Upload a document and ask me a question.",
+    "thanks": "You're welcome!",
+    "thank you": "You're welcome!",
+    "thanks a lot": "You're welcome!",
+    "thank you so much": "You're welcome!",
+    "bye": "Goodbye! Have a great day!",
+    "goodbye": "Goodbye! Have a great day!",
 }
 
 
@@ -137,46 +137,11 @@ BASIC_RESPONSES = {
 # =========================================================
 
 STOP_WORDS = {
-
-    "what",
-    "is",
-    "are",
-    "the",
-    "a",
-    "an",
-    "of",
-    "for",
-    "in",
-    "to",
-    "and",
-    "on",
-    "how",
-    "why",
-    "can",
-    "does",
-    "do",
-    "give",
-    "me",
-    "explain",
-    "tell",
-    "please",
-    "about",
-    "from",
-    "with",
-    "this",
-    "that",
-    "which",
-    "where",
-    "when",
-    "who",
-    "define",
-    "definition",
-    "describe",
-    "meaning",
-    "mean",
-    "means",
-    "whats",
-    "s"
+    "what", "is", "are", "the", "a", "an", "of", "for", "in", "to",
+    "and", "on", "how", "why", "can", "does", "do", "give", "me",
+    "explain", "tell", "please", "about", "from", "with", "this",
+    "that", "which", "where", "when", "who", "define", "definition",
+    "describe", "meaning", "mean", "means", "whats", "s",
 }
 
 
@@ -186,16 +151,12 @@ STOP_WORDS = {
 
 def clean_query(query):
 
-    words = re.findall(
-        r"[a-zA-Z0-9-]+",
-        query.lower()
-    )
+    words = re.findall(r"[a-zA-Z0-9-]+", query.lower())
 
     keywords = [
         word
         for word in words
-        if word not in STOP_WORDS
-        and len(word) > 1
+        if word not in STOP_WORDS and len(word) > 1
     ]
 
     if keywords:
@@ -219,45 +180,23 @@ def extract_pdf_text(pdf_bytes):
     for page_number, page in enumerate(reader.pages, start=1):
 
         try:
-
             page_text = page.extract_text()
 
             if page_text:
-
-                text_parts.append(
-                    page_text + "\n"
-                )
+                text_parts.append(page_text + "\n")
 
         except Exception as e:
-
-            print(
-                f"Error reading page {page_number}:",
-                e
-            )
+            print(f"Error reading page {page_number}:", e)
 
     text = "\n".join(text_parts)
 
     # Clean text
-
-    text = re.sub(
-        r"\n+",
-        " ",
-        text
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
+    text = re.sub(r"\n+", " ", text)
+    text = re.sub(r"\s+", " ", text)
     text = text.strip()
 
     if not text:
-
-        raise ValueError(
-            "No readable text was found in the uploaded PDF."
-        )
+        raise ValueError("No readable text was found in the uploaded PDF.")
 
     return text
 
@@ -271,41 +210,21 @@ def create_chunks(text):
     sentences = sent_tokenize(text)
 
     if not sentences:
+        raise ValueError("No sentences were found in the document.")
 
-        raise ValueError(
-            "No sentences were found in the document."
-        )
-
-    step = max(
-        1,
-        CHUNK_SIZE - CHUNK_OVERLAP
-    )
+    step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
 
     document_chunks = []
 
-    for i in range(
-        0,
-        len(sentences),
-        step
-    ):
+    for i in range(0, len(sentences), step):
 
-        chunk = " ".join(
-            sentences[
-                i:i + CHUNK_SIZE
-            ]
-        )
+        chunk = " ".join(sentences[i:i + CHUNK_SIZE])
 
         if chunk.strip():
-
-            document_chunks.append(
-                chunk.strip()
-            )
+            document_chunks.append(chunk.strip())
 
     if not document_chunks:
-
-        raise ValueError(
-            "No chunks were created from the document."
-        )
+        raise ValueError("No chunks were created from the document.")
 
     return document_chunks
 
@@ -318,45 +237,24 @@ def build_keyword_index(document_chunks):
 
     new_keyword_index = {}
 
-    chunks_lower = [
-        chunk.lower()
-        for chunk in document_chunks
-    ]
+    for chunk_number, chunk in enumerate(document_chunks):
 
-    for chunk_number, chunk in enumerate(
-        chunks_lower
-    ):
-
-        words = set(
-            re.findall(
-                r"\b[a-zA-Z0-9-]+\b",
-                chunk
-            )
-        )
+        words = set(re.findall(r"\b[a-zA-Z0-9-]+\b", chunk.lower()))
 
         for word in words:
 
-            if (
-                word not in STOP_WORDS
-                and len(word) > 1
-            ):
+            if word not in STOP_WORDS and len(word) > 1:
 
-                new_keyword_index.setdefault(
-                    word,
-                    []
-                ).append(chunk_number)
+                new_keyword_index.setdefault(word, []).append(chunk_number)
 
     return new_keyword_index
 
 
 # =========================================================
-# PROCESS UPLOADED DOCUMENT
+# REBUILD COMBINED INDEX FROM ALL DOCUMENTS
 # =========================================================
 
-def process_uploaded_document(
-    pdf_bytes,
-    filename
-):
+def rebuild_index():
 
     global index
     global chunks
@@ -364,39 +262,58 @@ def process_uploaded_document(
     global keyword_index
     global current_document_name
 
-    print(
-        f"Processing uploaded document: {filename}"
-    )
+    if not documents:
+        index = None
+        chunks = []
+        chunk_metadata = []
+        keyword_index = {}
+        current_document_name = None
+        return
 
-    # -----------------------------------------------------
-    # EXTRACT TEXT
-    # -----------------------------------------------------
+    all_chunks = []
+    all_metadata = []
+    all_embeddings = []
 
-    text = extract_pdf_text(
-        pdf_bytes
-    )
+    for name, doc in documents.items():
 
-    print(
-        "Extracted characters:",
-        len(text)
-    )
+        for text in doc["chunks"]:
 
-    # -----------------------------------------------------
-    # CREATE CHUNKS
-    # -----------------------------------------------------
+            all_metadata.append({
+                "chunk_id": len(all_chunks),
+                "source": name,
+            })
 
-    new_chunks = create_chunks(
-        text
-    )
+            all_chunks.append(text)
 
-    print(
-        "Total chunks:",
-        len(new_chunks)
-    )
+        all_embeddings.append(doc["embeddings"])
 
-    # -----------------------------------------------------
-    # CREATE EMBEDDINGS
-    # -----------------------------------------------------
+    embeddings = np.vstack(all_embeddings).astype("float32")
+
+    new_index = faiss.IndexFlatIP(embeddings.shape[1])
+    new_index.add(embeddings)
+
+    index = new_index
+    chunks = all_chunks
+    chunk_metadata = all_metadata
+    keyword_index = build_keyword_index(all_chunks)
+    current_document_name = ", ".join(documents.keys())
+
+
+# =========================================================
+# PROCESS UPLOADED DOCUMENT (adds to existing documents)
+# =========================================================
+
+def process_uploaded_document(pdf_bytes, filename):
+
+    print(f"Processing uploaded document: {filename}")
+
+    text = extract_pdf_text(pdf_bytes)
+
+    print("Extracted characters:", len(text))
+
+    new_chunks = create_chunks(text)
+
+    print("Total chunks:", len(new_chunks))
 
     print("Creating embeddings...")
 
@@ -405,80 +322,40 @@ def process_uploaded_document(
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
-        batch_size=32
-    )
+        batch_size=32,
+    ).astype("float32")
 
-    embeddings = embeddings.astype(
-        "float32"
-    )
+    # Same filename = replace the old version
+    documents[filename] = {
+        "chunks": new_chunks,
+        "embeddings": embeddings,
+    }
 
-    # -----------------------------------------------------
-    # CREATE FAISS INDEX
-    # -----------------------------------------------------
+    rebuild_index()
 
-    dimension = embeddings.shape[1]
-
-    new_index = faiss.IndexFlatIP(
-        dimension
-    )
-
-    new_index.add(
-        embeddings
-    )
-
-    # -----------------------------------------------------
-    # METADATA
-    # -----------------------------------------------------
-
-    new_metadata = []
-
-    for i in range(
-        len(new_chunks)
-    ):
-
-        new_metadata.append({
-
-            "chunk_id": i,
-
-            "source": filename
-
-        })
-
-    # -----------------------------------------------------
-    # KEYWORD INDEX
-    # -----------------------------------------------------
-
-    new_keyword_index = build_keyword_index(
-        new_chunks
-    )
-
-    # -----------------------------------------------------
-    # UPDATE GLOBAL DATA
-    # -----------------------------------------------------
-
-    index = new_index
-
-    chunks = new_chunks
-
-    chunk_metadata = new_metadata
-
-    keyword_index = new_keyword_index
-
-    current_document_name = filename
-
-    print(
-        "Document processing completed."
-    )
+    print("Document processing completed.")
 
     return {
-
         "filename": filename,
-
-        "chunks": len(chunks),
-
-        "characters": len(text)
-
+        "chunks": len(new_chunks),
+        "characters": len(text),
     }
+
+
+# =========================================================
+# REMOVE / RESET DOCUMENTS
+# =========================================================
+
+def remove_document(filename):
+
+    documents.pop(filename, None)
+    rebuild_index()
+
+
+def reset_documents():
+
+    documents.clear()
+    rebuild_index()
 
 
 # =========================================================
@@ -487,14 +364,11 @@ def process_uploaded_document(
 
 def document_loaded():
 
-    return (
-        index is not None
-        and len(chunks) > 0
-    )
+    return index is not None and len(chunks) > 0
 
 
 # =========================================================
-# CURRENT DOCUMENT
+# CURRENT DOCUMENT(S)
 # =========================================================
 
 def get_document_name():
@@ -506,194 +380,100 @@ def get_document_name():
 # KEYWORD SEARCH
 # =========================================================
 
-def keyword_search(
-    search_query
-):
+def keyword_search(search_query):
 
     keywords = search_query.split()
 
     keyword_scores = {}
 
-    chunks_lower = [
-        chunk.lower()
-        for chunk in chunks
-    ]
-
-    # -----------------------------------------------------
-    # WORD MATCHING
-    # -----------------------------------------------------
-
+    # Word matching
     for keyword in keywords:
 
-        for chunk_number in keyword_index.get(
-            keyword,
-            []
-        ):
+        for chunk_number in keyword_index.get(keyword, []):
 
-            keyword_scores[
-                chunk_number
-            ] = keyword_scores.get(
-                chunk_number,
-                0
-            ) + 1
+            keyword_scores[chunk_number] = (
+                keyword_scores.get(chunk_number, 0) + 1
+            )
 
-    # -----------------------------------------------------
-    # EXACT PHRASE BONUS
-    # -----------------------------------------------------
-
+    # Exact phrase bonus
     if len(keywords) > 1:
 
-        for chunk_number, chunk in enumerate(
-            chunks_lower
-        ):
+        for chunk_number, chunk in enumerate(chunks):
 
-            if search_query in chunk:
+            if search_query in chunk.lower():
 
-                keyword_scores[
-                    chunk_number
-                ] = keyword_scores.get(
-                    chunk_number,
-                    0
-                ) + 3
+                keyword_scores[chunk_number] = (
+                    keyword_scores.get(chunk_number, 0) + 3
+                )
 
-    results = sorted(
+    return sorted(
         keyword_scores.items(),
         key=lambda x: x[1],
-        reverse=True
+        reverse=True,
     )
-
-    return results
 
 
 # =========================================================
 # RETRIEVE RELEVANT CHUNKS
 # =========================================================
 
-def retrieve_chunks(
-    user_query
-):
+def retrieve_chunks(user_query):
 
     if not document_loaded():
-
         return []
 
-    search_query = clean_query(
-        user_query
-    )
+    search_query = clean_query(user_query)
 
-    top_k = min(
-        FAISS_TOP_K,
-        len(chunks)
-    )
+    top_k = min(FAISS_TOP_K, len(chunks))
 
-    # -----------------------------------------------------
-    # VECTOR SEARCH
-    # -----------------------------------------------------
-
+    # Vector search
     query_embeddings = embedding_model.encode(
-
-        [
-            search_query,
-            user_query
-        ],
-
+        [search_query, user_query],
         convert_to_numpy=True,
-
         normalize_embeddings=True,
-
-        show_progress_bar=False
-
+        show_progress_bar=False,
     ).astype("float32")
 
-
-    scores, indices = index.search(
-        query_embeddings,
-        top_k
-    )
-
+    scores, indices = index.search(query_embeddings, top_k)
 
     vector_results = []
 
     for rank in range(top_k):
 
-        for row in range(
-            indices.shape[0]
-        ):
+        for row in range(indices.shape[0]):
 
-            idx = int(
-                indices[row][rank]
-            )
+            idx = int(indices[row][rank])
 
-            if (
-                0 <= idx < len(chunks)
-                and idx not in vector_results
-            ):
+            if 0 <= idx < len(chunks) and idx not in vector_results:
+                vector_results.append(idx)
 
-                vector_results.append(
-                    idx
-                )
+    # Keyword search
+    keyword_results = keyword_search(search_query)
 
-
-    # -----------------------------------------------------
-    # KEYWORD SEARCH
-    # -----------------------------------------------------
-
-    keyword_results = keyword_search(
-        search_query
-    )
-
-
-    # -----------------------------------------------------
-    # COMBINE RESULTS
-    # -----------------------------------------------------
-
+    # Combine: keyword results first, then vector results
     final_indices = []
 
-    # Keyword results first
-
-    for chunk_number, _ in keyword_results[
-        :KEYWORD_TOP_K
-    ]:
+    for chunk_number, _ in keyword_results[:KEYWORD_TOP_K]:
 
         if chunk_number not in final_indices:
-
-            final_indices.append(
-                chunk_number
-            )
-
-
-    # Vector results
+            final_indices.append(chunk_number)
 
     for chunk_number in vector_results:
 
         if chunk_number not in final_indices:
+            final_indices.append(chunk_number)
 
-            final_indices.append(
-                chunk_number
-            )
-
-
-    # Limit context
-
-    final_indices = final_indices[
-        :MAX_CONTEXT_CHUNKS
-    ]
-
+    final_indices = final_indices[:MAX_CONTEXT_CHUNKS]
 
     retrieved_chunks = []
 
     for idx in final_indices:
 
         retrieved_chunks.append({
-
             "chunk_id": idx,
-
             "text": chunks[idx],
-
-            "metadata": chunk_metadata[idx]
-
+            "metadata": chunk_metadata[idx],
         })
-
 
     return retrieved_chunks
 
@@ -702,98 +482,41 @@ def retrieve_chunks(
 # ASK QUESTION
 # =========================================================
 
-def ask_question(
-    user_query
-):
+def ask_question(user_query):
 
-    user_query = (
-        user_query or ""
-    ).strip()
+    user_query = (user_query or "").strip()
 
-
-    # -----------------------------------------------------
-    # EMPTY QUERY
-    # -----------------------------------------------------
-
+    # Empty query
     if not user_query:
-
         return "Please enter a question."
 
-
-    # -----------------------------------------------------
-    # CHECK DOCUMENT
-    # -----------------------------------------------------
-
+    # Check document
     if not document_loaded():
+        return "Please upload a PDF document before asking a question."
 
-        return (
-            "Please upload a PDF document "
-            "before asking a question."
-        )
-
-
-    # -----------------------------------------------------
-    # BASIC RESPONSES
-    # -----------------------------------------------------
-
-    basic_query = re.sub(
-        r"\s+",
-        " ",
-        user_query.lower()
-    ).strip()
-
-    basic_query = basic_query.rstrip(
-        "!.?"
-    )
-
+    # Basic responses
+    basic_query = re.sub(r"\s+", " ", user_query.lower()).strip()
+    basic_query = basic_query.rstrip("!.?")
 
     if basic_query in BASIC_RESPONSES:
+        return BASIC_RESPONSES[basic_query]
 
-        return BASIC_RESPONSES[
-            basic_query
-        ]
-
-
-    # -----------------------------------------------------
-    # RETRIEVE
-    # -----------------------------------------------------
-
-    retrieved_chunks = retrieve_chunks(
-        user_query
-    )
-
+    # Retrieve
+    retrieved_chunks = retrieve_chunks(user_query)
 
     if not retrieved_chunks:
+        return "No data available in the uploaded document."
 
-        return (
-            "No data available in the uploaded document."
-        )
-
-
-    # -----------------------------------------------------
-    # BUILD CONTEXT
-    # -----------------------------------------------------
-
+    # Build context
     context_parts = []
 
     for item in retrieved_chunks:
 
-        source = item[
-            "metadata"
-        ][
-            "source"
-        ]
-
-        chunk_id = item[
-            "chunk_id"
-        ]
-
-        text = item[
-            "text"
-        ]
+        source = item["metadata"]["source"]
+        chunk_id = item["chunk_id"]
+        text = item["text"]
 
         context_parts.append(
-
             f"""
 Source: {source}
 Chunk: {chunk_id}
@@ -802,21 +525,14 @@ Chunk: {chunk_id}
 """
         )
 
+    context = "\n\n".join(context_parts)
 
-    context = "\n\n".join(
-        context_parts
-    )
-
-
-    # -----------------------------------------------------
-    # PROMPT
-    # -----------------------------------------------------
-
+    # Prompt
     prompt = f"""
 
 You are a document question-answering assistant.
 
-The user uploaded a document and asked a question.
+The user uploaded one or more documents and asked a question.
 
 Answer ONLY using information contained in the
 provided document context.
@@ -851,69 +567,34 @@ User Question:
 Answer:
 """
 
-
-    # -----------------------------------------------------
-    # GEMINI
-    # -----------------------------------------------------
-
+    # Gemini
     try:
 
         response = client.models.generate_content(
-
             model=GEMINI_MODEL,
-
             contents=prompt,
-
             config=types.GenerateContentConfig(
-
                 temperature=0,
-
                 max_output_tokens=MAX_OUTPUT_TOKENS,
-
-                candidate_count=1
-
-            )
-
+                candidate_count=1,
+            ),
         )
 
-
-        if (
-            response.text
-            and response.text.strip()
-        ):
-
+        if response.text and response.text.strip():
             return response.text.strip()
 
-
         try:
-
             print(
                 "Empty Gemini response:",
-                response.candidates[
-                    0
-                ].finish_reason
+                response.candidates[0].finish_reason,
             )
-
         except Exception:
+            print("Empty Gemini response.")
 
-            print(
-                "Empty Gemini response."
-            )
-
-
-        return (
-            "The model returned an empty response. "
-            "Please try again."
-        )
-
+        return "The model returned an empty response. Please try again."
 
     except Exception as e:
 
-        print(
-            "Gemini error:",
-            e
-        )
+        print("Gemini error:", e)
 
-        return (
-            "Unable to generate an answer right now."
-        )
+        return "Unable to generate an answer right now."
